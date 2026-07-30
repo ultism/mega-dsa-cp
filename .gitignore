@@ -1,0 +1,28 @@
+# local scratch / cloned repos
+tmp/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# C/C++/CUDA build
+build/
+cmake-build-*/
+*.o
+*.so
+*.a
+*.cu.o
+CMakeCache.txt
+CMakeFiles/
+
+# editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
