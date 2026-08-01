@@ -1,6 +1,9 @@
 # local scratch / cloned repos
 tmp/
 
+# run output logs (Modal runs, benches)
+log/
+
 # Python
 __pycache__/
 *.py[cod]
