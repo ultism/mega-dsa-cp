@@ -21,6 +21,7 @@ DeepSeek V4 DSA（DeepSeek Sparse Attention）decode 的 megakernel 实现：把
 | sglang | DSA CP 是独立开关但**只管 prefill**（KV 全复制，decode 各 rank 冗余计算，零 CP 通信）；普通 DCP 不接 DSA 后端，且 CUDA 上 DCP+投机只允许 Kimi Linear |
 | vllm-ascend | 三种形态：token 分片 DSA-CP（KV 复制，计算÷cp，权重复制）；SFA DCP（KV 分片 + indexer 复制 + remap）；fused lightning_indexer（logits+topk 单 kernel）已产品化；MTP draft 步间 topk 复用（skip_topk/IndexCache） |
 | flashinfer PR #3943 | CuTe DSL HCA kernel（V4 sparse MLA decode，SWA 128 窗口 + 128:1 压缩双池，fp8，128 head，512 latent，2-CTA cluster，warp 专用化，persistent 可选，q_len>1 支持）；**无跨卡通信**，topk 外部输入 |
+| sglang #26209/#27059/#30546 | FP4（MXFP4）indexer 数据：index-K 132B→68B/token/层（-48%，+9.9% KV 容量），logits kernel 1.49-1.53×（SM100 L=8K/32K），E2E +6-8%，精度 GSM8K -1.5pt / GPQA ~0；sglang 做成 opt-in 默认关（产品保守）；kernel 在 DeepGEMM（`fp8_fp4_paged_mqa_logits`） |
 | flashinfer cutedsl_megamoe | CuTe DSL 多卡 megakernel 完整范式：symm-mem + peer offset 映射 + sense-reversing barrier + TMA pull/red.sys push |
 | tirx-kernels | megakernel DSL（TIRx/TVM）：persistent kernel + packed task 队列（静态/动态 MPMC）+ etensor 两阶段 notify；bs1 收益 1.66x；先手写后 DSL 的工程路线 |
 
@@ -35,6 +36,16 @@ DeepSeek V4 DSA（DeepSeek Sparse Attention）decode 的 megakernel 实现：把
 - token 分片（Ascend DSA-CP）会复制 attention 权重（权重流量 ×cp），decode 中小 batch 下是负优化，只适合 prefill/超大 batch
 - KV 分片保持权重 TP 切分不变，计算和显存同时 ÷cp
 - 二维 (token×KV) 分解留接口不实现（cp≥16 时控制候选交换载荷用）
+
+## indexer 精度决策：直接 FP4（MXFP4），不留 FP8 旋钮
+
+打分路径（index-K cache + q_indexer + logits MMA）一步到位 MXFP4，不做 FP8/FP4 双模。理由：sf（scale factor）路径决定 tile 布局、smem 分区、MMA 类型与量化写路径，后期补加等于重做 logits/compressor 两块 tile；megakernel 的图与 buffer 布局冻结后可调旋钮少，实验算子直接锁定终态格式。sglang 默认 FP8 是产品保守（精度 -1.5pt GSM8K），实验路径不需要这个保守。
+
+- **格式**：index-K 每 entry = 64B packed E2M1 + 4B（4×UE8M0 组 32 scale）= 68B（page=64 entry 布局不变：数据段后接 scale 段）；q_indexer 同样 FP4 + q_sf，**q_sf 由 kernel 内应用**，不折进 head-gate weights（weights 保持 fp32 直达 epilogue）
+- **MMA**：mxf4 block-scaled UMMA（SM100 原生，K=128 全 K）；SF 走 TMEM 布局
+- **写路径**：compressor tile 产出 index-K 时量化 E2M1 + UE8M0 ceil scale（对 DeepGEMM 量化器 bit-identical：`max(amax/6, 1e-4)`、过 bf16 舍入）
+- **数值参照**：tile 级对 DeepGEMM `fp8_fp4_paged_mqa_logits`（同输入逐值）；E2E 仍对 FP8 参考实现做 topk 集合召回 + attention out 容差对比（FP4↔FP8 选择差异是预期的）
+- **参考实现**：`~/svdquant-kernels/cute_kernels/gemm_w4a4/`（自有 W4A4 blockscale GEMM，含 TMEM/SF 布局验证）、cutlass `examples/python/CuTeDSL/cute/blackwell/kernel/blockscaled_gemm/`（SM100/103 persistent blockscaled GEMM）+ `cutlass/utils/blockscaled_layout.py`；flashinfer `msa_ops/cute_dsl/proxy_score_fp4_sm12x.py`（注意力场景 FP4 MMA）；sglang `cutedsl_fp8_paged_mqa_logits.py`（pipeline 骨架）；DeepGEMM fp8_fp4（数值 oracle）
 
 ## megakernel vs 最优 graph 实现（收益口径）
 
@@ -81,7 +92,7 @@ megakernel 独有：
 图拓扑（任务类型、通信边、事件表、buffer 布局）从骨架阶段**冻结**；cp=1 与 cp=k 是同一幅图的两种执行，通信任务在 cp=1 下退化但仍在图中，不存在后期追加边。
 
 - **Phase 0 骨架**：0.1 event 系统（见 event-system.md，已验收）→ 0.2 静态队列调度器（**已验收**：`mega_dsa_cp/schedule/{codegen,device}.py`——codegen 把校验过的单层 DAG 拓扑序发牌成每 CTA packed 队列（header + 3 坐标 + 内联 wait/notify 边，wait≤63/notify≤63），设备端 smem 暂存 + cursor 遍历 + scope 分派 wait + 单发射者 notify + 动态上界标量读取；CPU 30 随机 DAG + 多 rank 对称性过，单卡 512 任务×2 种子×2 相位过，双卡跨 rank DAG×2 相位过）→ 0.3 通信原语+buffer 布局（**已验收**：`mega_dsa_cp/comm/{primitives,device,buffers}.py`——bulk S2G push（`cp.async.bulk` 1D + commit/wait + `fence.proxy.async.global` + notify 链）、`multimem.st` allgather、`multimem.ld_reduce` fp32 交换机归约、SymmetricArena 命名区域×相位轮换；双卡 2 相位全过，NVLS multicast 在 Modal B200:2 可用）→ 0.4 空壳 pipeline cp=2 端到端（**骨架已冻结**：`tests/test_skeleton_cp2.py`——30 任务/rank、14 事件的全拓扑过调度器；候选 128KB multimem.st allgather 校验、partials 4MB（16×256KB）smem→bulk push 到 owner inbox 双 rank 校验、2 相位单调复用全过；热态 wall 566µs/层（stub 算子 + 真实通信量），冷启动 6.9ms）**Phase 0 完成**
-- **Phase 1 计算 tile**（图不变，cp=1 退化执行下对数值）：1.1 logits+topk 融合 → 1.2 attention（HCA 改造）→ 1.3 compressor → 1.4 通信任务实现 → 1.5 GEMM tiles
+- **Phase 1 计算 tile**（图不变，cp=1 退化执行下对数值）：1.1 logits+topk 融合（**FP4 MXFP4 打分**，mxf4 UMMA + 局部 top-K 候选堆，logits 不落 HBM）→ 1.2 attention（HCA 改造）→ 1.3 compressor（含 FP4 量化写 index-K）→ 1.4 通信任务实现 → 1.5 GEMM tiles
 - **Phase 2 跨卡执行**：cp=2→4→8，数值双参照（自身 cp=1 + vLLM TP），性能实验矩阵
 - **Phase 3（可选）**：DSL 化（tirx 方法论：队列字节等价+数值等价）、动态 MPMC 调度、2D 分解
 
@@ -91,7 +102,7 @@ megakernel 独有：
 
 ## 参考代码（tmp/）
 
-文档：`docs/overview.md`（本文）、`docs/event-system.md`（Phase 0.1 spec）、`docs/gotchas.md`（已知坑与设计约束）
+文档：`docs/overview.md`（本文）、`docs/event-system.md`（Phase 0.1 spec）、`docs/gotchas.md`（已知坑与设计约束）、`docs/phase1-logits-tile.md`（Phase 1.1 FP4 logits+topK tile 设计）
 
 - `tmp/flashinfer`（分支 pr-3943）：HCA kernel，`flashinfer/cute_dsl/attention/dsa/`
 - `tmp/flashinfer-pr3381`：DSA compress+norm+rope CuTe DSL kernel

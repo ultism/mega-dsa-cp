@@ -119,6 +119,15 @@ def phase02_dual() -> None:
     )
 
 
+@app.function(gpu="B200", image=image, timeout=900, retries=0)
+def phase11_single() -> None:
+    """Phase 1.1 single-GPU: FP4 paged MQA logits vs torch fp32 reference."""
+    _run(["nvidia-smi"])
+    _run(["python", "tests/test_logits_fp4.py", "--tiny"], timeout=420)
+    _run(["python", "tests/test_logits_fp4.py"], timeout=420)
+    _run(["python", "tests/test_logits_fp4.py", "--topk"], timeout=420)
+
+
 @app.function(gpu="B200:2", image=image, timeout=900, retries=0)
 def phase03_dual() -> None:
     """Phase 0.3 dual-GPU: bulk push + multimem primitives."""
