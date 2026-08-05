@@ -11,7 +11,7 @@
   - `weights[b]`：head-gate，heads×q_len 个 fp32（q_sf 不折叠进 weights，kernel 内应用——MXFP4 决策）
   - index-K cache：paged，page=64 entry，每 entry 68B（布局见 §2）
   - `block_table[b]`、`seq_len[b]`（设备侧标量，标量动态）
-- 输出：候选 `(val fp32, idx u32)` × C（C = min(K=2048, chunk_len)），写入 arena cand buffer，notify `cand_ready[b, t, c]`（t = spec 槽位）
+- 输出：候选 `(val fp32, idx u32)` × C（C = min(K, chunk_len)；K = 512（V4 Flash）/ 1024（V4 Pro），kernel 编译期参数），写入 arena cand buffer，notify `cand_ready[b, t, c]`（t = spec 槽位）
 - 精确性：对段内全部分数精确 top-C（阈值流式选择，§5），段间由 cand 归并树精确合并（图既有结构）
 
 ## 2. FP4 数据布局
@@ -50,13 +50,13 @@ page 字节数 4352B；TMA 粒度 = 2 page = 128 entry（8704B）
 
 ## 5. 融合 top-K 候选堆（epilogue）
 
-- smem 驻留堆：`2048 × (fp32 val, u32 idx)` = 16KB，外加 overflow 区 2048（共 32KB）；维护当前阈值 θ（堆满后 = 堆内最小值，即精确第 2048 名）
+- smem 驻留堆：`K × (fp32 val, u32 idx)`（K=1024 时 8KB/spec 槽位），外加 overflow 区 K（容量与堆 1:1 右尺寸化，1.1b 从 2048 降至 1024，q_len=2 共省 ~40KB smem）；维护当前阈值 θ（堆满后 = 堆内最小值，即精确第 K 名）
 - 每块 128 分数（每 spec 槽位）：epilogue 的 relu2_fma 归约（svdquant/sglang 同款 packed f32x2）产出分数后：
   1. **seqlen 掩码**：kv_pos ≥ seq_len[b] 丢弃（替代 sglang 下游 lengths 掩码，几乎免费）
   2. **SWA 强制包含**：kv_pos ∈ [seq_len−128, seq_len) 不打分（sglang 的 +inf 技巧）——附带收益：logits 与 kvwrite（新 token 写入）**解耦**，不需要 wait kvwrite
   3. θ 过滤 → 命中者 warp 聚合 append 到 overflow
-  4. overflow 满 → 合并（堆+overflow 重选 top-2048，更新 θ）；合并次数 ≤ chunk_len/2048 ≈ 4-8 次/任务
-- 收尾：堆内 2048 个按值排序（或仅写出无序 + val，归并树不在乎顺序），写 arena cand buffer，notify
+  4. overflow 将满（≥K−128）→ 合并（堆+overflow 重选 top-K，更新 θ）；合并次数 ≈ chunk_len/K 量级/任务
+- 收尾：堆内 K 个按值排序（或仅写出无序 + val，归并树不在乎顺序），写 arena cand buffer，notify
 - K > chunk_len 时（短上下文退化）：全量写出 + 计数，归并树兼容（对应 sglang naive_topk 捷径）
 
 ## 6. warp 组织与流水
@@ -78,13 +78,13 @@ page 字节数 4352B；TMA 粒度 = 2 page = 128 entry（8704B）
 - wait：`qprep_done`（q_fp4/sf/weights 就绪，整批单事件）
 - 隐式依赖：index-K cache 的**历史**内容无事件（上 step 已写，kernel 边界同步保证）；本 step 新 token 由 SWA +inf 解耦（§5）
 - notify：`cand_ready[b, t, c]`，arity=1，cand 归并树叶子
-- arena 区域：`cand_buf[b, t, c]`（2048×8B，相位×2 轮换）、`q_fp4/q_sf/w`（qprep 产出区）
+- arena 区域：`cand_buf[b, t, c]`（K×8B = 4/8KB，相位×2 轮换）、`q_fp4/q_sf/w`（qprep 产出区）
 
 ## 8. 数值验证
 
 1. **logits 对拍**（tile 级）：同输入对 DeepGEMM `fp8_fp4_paged_mqa_logits`，fp32 分数逐值容差（UE8M0 量化一致时容差 ~1e-3 相对）
 2. **top-K 对拍**：候选集合 vs torch 参考（fp32 dequant ground truth 的精确 top-K）——集合一致率 100%（同分数精度下），边界分数允许 ±1 替换
-3. **E2E 召回**：vs vLLM/sglang FP8 路径的 top-2048 集合召回率（FP4↔FP8 差异是预期的，记录数值，预期 ≥99%）
+3. **E2E 召回**：vs vLLM/sglang FP8 路径的 top-512/1024 集合召回率（FP4↔FP8 差异是预期的，记录数值，预期 ≥99%）
 
 ## 9. 开放问题（实现期定）
 

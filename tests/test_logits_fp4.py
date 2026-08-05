@@ -68,13 +68,12 @@ def main() -> None:
         raise SystemExit(1)
 
 
-def main_topk() -> None:
+def main_topk(top_k: int) -> None:
     torch.cuda.set_device(0)
     torch.backends.cuda.matmul.allow_tf32 = False
-    from mega_dsa_cp.tiles.logits import TOP_K
 
     B, max_pages, q_len = 2, 64, 2  # S = 8192
-    blocks_per_chunk = 32  # 2 chunks x 4096 tokens (real selection: 4096 -> 2048)
+    blocks_per_chunk = 32  # 2 chunks x 4096 tokens (real selection: 4096 -> top_k)
     n_chunks = max_pages // blocks_per_chunk
     chunk_tokens = blocks_per_chunk * 128
 
@@ -85,31 +84,24 @@ def main_topk() -> None:
     )
     S = max_pages * 128
     seq_lens = torch.full((B,), S, dtype=torch.int32, device="cuda")
-    cand_v = torch.full((B, q_len, n_chunks, TOP_K), float("nan"), device="cuda")
-    cand_i = torch.full((B, q_len, n_chunks, TOP_K), -1, dtype=torch.int32, device="cuda")
+    cand_v = torch.full((B, q_len, n_chunks, top_k), float("nan"), device="cuda")
+    cand_i = torch.full((B, q_len, n_chunks, top_k), -1, dtype=torch.int32, device="cuda")
     cand_c = torch.zeros((B, q_len, n_chunks), dtype=torch.int32, device="cuda")
     logits = torch.zeros((B * q_len, S), device="cuda")  # unused in fused mode
 
-    print("inputs ready, compiling (fused topk)...", flush=True)
+    print(f"inputs ready, compiling (fused topk, K={top_k})...", flush=True)
     dbg = torch.zeros(192, dtype=torch.int32, pin_memory=True)
     run_fp4_paged_mqa_logits(
         kv_fused, q_packed, q_sf_atom, w, bt, logits, blocks_per_chunk,
         seq_lens=seq_lens, cand_v=cand_v, cand_i=cand_i, cand_c=cand_c, dbg=dbg,
+        top_k=top_k,
     )
     print("launched, syncing...", flush=True)
     torch.cuda.synchronize()
     print("kernel done", flush=True)
-    for i in range(blocks_per_chunk):
-        print(
-            f"  blk{i:2d} heap={dbg[16+i*2].item():5d} ovf={dbg[17+i*2].item():5d} "
-            f"score={dbg[64+i].item() & 0xFFFFFFFF:#010x} "
-            f"sW0={dbg[96+i].item() & 0xFFFFFFFF:#010x} "
-            f"acc0={dbg[128+i].item() & 0xFFFFFFFF:#010x}",
-            flush=True,
-        )
     for t in range(q_len):
         for c in range(n_chunks):
-            base = (t * n_chunks + c) * 4
+            base = 128 + (t * n_chunks + c) * 4
             print(
                 f"  cnt[t{t},c{c}] heap={dbg[base].item()} "
                 f"ovf={dbg[base+1].item()} merges={dbg[base+2].item()} "
@@ -125,7 +117,7 @@ def main_topk() -> None:
             for c in range(n_chunks):
                 lo, hi = c * chunk_tokens, min((c + 1) * chunk_tokens, limit)
                 seg = ref[b * q_len + t, lo:hi]
-                k = min(TOP_K, seg.numel())
+                k = min(top_k, seg.numel())
                 exp_v, exp_i = torch.topk(seg, k)
                 exp_i = exp_i + lo
                 cnt = int(cand_c[b, t, c].item())
@@ -144,13 +136,14 @@ def main_topk() -> None:
                 )
                 if not v_ok or overlap < 0.999:
                     n_bad += 1
-    print("PASS" if n_bad == 0 else f"FAIL ({n_bad} bad)")
+    print(f"K={top_k}: " + ("PASS" if n_bad == 0 else f"FAIL ({n_bad} bad)"))
     if n_bad:
         raise SystemExit(1)
 
 
 if __name__ == "__main__":
     if "--topk" in sys.argv:
-        main_topk()
+        for top_k in (512, 1024):  # V4 Flash / Pro
+            main_topk(top_k)
     else:
         main()

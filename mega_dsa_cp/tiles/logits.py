@@ -41,10 +41,9 @@ PAGE_ELEMS_FP4 = PAGE_BYTES * 2  # fp4 elements per page stride
 SF_VEC_SIZE = 32
 
 # Fused top-K (v2): per-spec-slot heap + overflow in smem; threshold-filtered
-# inserts; radix-select merge when overflow nears capacity.
-TOP_K = 2048
-OVF_CAP = 2048
-OVF_TRIGGER = OVF_CAP - 128  # one block adds at most 128 inserts per spec slot
+# inserts; radix-select merge when overflow nears capacity. Heap capacity ==
+# top_k exactly; V4 official K = 512 (Flash) / 1024 (Pro).
+DEFAULT_TOP_K = 1024
 
 
 @dsl_user_op
@@ -143,11 +142,17 @@ class Fp4PagedMQALogits:
         num_kv_stage: int = 8,
         num_acc_stage: int = 2,
         fused_topk: bool = False,
+        top_k: int = DEFAULT_TOP_K,
     ):
         self.n_heads = n_heads
         self.q_len = q_len
         self.n = n_heads * q_len  # MMA N
         assert self.n <= 256, "single-MMA TMEM limit (N <= 256)"
+        assert top_k % 128 == 0, "top_k must be a multiple of 128"
+        self.top_k = top_k
+        self.ovf_cap = top_k
+        # one page adds at most 128 inserts per spec slot
+        self.ovf_trigger = self.ovf_cap - 128
         self.num_kv_stage = num_kv_stage
         self.num_acc_stage = num_acc_stage
         self.fused_topk = fused_topk
@@ -245,8 +250,8 @@ class Fp4PagedMQALogits:
         bt_ptr: cute.Pointer,  # int32 (B, max_pages)
         logits_ptr: cute.Pointer,  # fp32 (B*q_len, max_pages*128)
         seq_lens_ptr: cute.Pointer,  # int32 (B,) — fused_topk masking
-        cand_v_ptr: cute.Pointer,  # fp32 (B, q_len, n_chunks, TOP_K)
-        cand_i_ptr: cute.Pointer,  # int32 (B, q_len, n_chunks, TOP_K)
+        cand_v_ptr: cute.Pointer,  # fp32 (B, q_len, n_chunks, self.top_k)
+        cand_i_ptr: cute.Pointer,  # int32 (B, q_len, n_chunks, self.top_k)
         cand_c_ptr: cute.Pointer,  # int32 (B, q_len, n_chunks)
         dbg_ptr: cute.Pointer,  # int32 (8,) progress markers
         dims: Tuple[Int32, Int32, Int32, Int32, Int32],
@@ -296,13 +301,13 @@ class Fp4PagedMQALogits:
         mCandV = cute.make_tensor(
             cand_v_ptr,
             cute.make_ordered_layout(
-                (batch_size, self.q_len, n_chunks, TOP_K), order=(3, 2, 1, 0)
+                (batch_size, self.q_len, n_chunks, self.top_k), order=(3, 2, 1, 0)
             ),
         )
         mCandI = cute.make_tensor(
             cand_i_ptr,
             cute.make_ordered_layout(
-                (batch_size, self.q_len, n_chunks, TOP_K), order=(3, 2, 1, 0)
+                (batch_size, self.q_len, n_chunks, self.top_k), order=(3, 2, 1, 0)
             ),
         )
         mCandC = cute.make_tensor(
@@ -544,19 +549,19 @@ class Fp4PagedMQALogits:
         sScrAV = sScrAI = sBins = sAux = sCnt = sTheta = sFlags = None
         if cutlass.const_expr(self.fused_topk):
             sHeapV = smem.allocate_tensor(
-                Float32, cute.make_layout((self.q_len, TOP_K)), 16
+                Float32, cute.make_layout((self.q_len, self.top_k)), 16
             )
             sHeapI = smem.allocate_tensor(
-                Int32, cute.make_layout((self.q_len, TOP_K)), 16
+                Int32, cute.make_layout((self.q_len, self.top_k)), 16
             )
             sOvfV = smem.allocate_tensor(
-                Float32, cute.make_layout((self.q_len, OVF_CAP)), 16
+                Float32, cute.make_layout((self.q_len, self.ovf_cap)), 16
             )
             sOvfI = smem.allocate_tensor(
-                Int32, cute.make_layout((self.q_len, OVF_CAP)), 16
+                Int32, cute.make_layout((self.q_len, self.ovf_cap)), 16
             )
-            sScrAV = smem.allocate_tensor(Float32, cute.make_layout((TOP_K,)), 16)
-            sScrAI = smem.allocate_tensor(Int32, cute.make_layout((TOP_K,)), 16)
+            sScrAV = smem.allocate_tensor(Float32, cute.make_layout((self.top_k,)), 16)
+            sScrAI = smem.allocate_tensor(Int32, cute.make_layout((self.top_k,)), 16)
             sBins = smem.allocate_tensor(Int32, cute.make_layout((256,)), 16)
             sAux = smem.allocate_tensor(Int32, cute.make_layout((4,)), 16)
             # per spec slot: [heap_cnt, ovf_cnt, out_cnt, bnd_cnt]
@@ -814,19 +819,19 @@ class Fp4PagedMQALogits:
                     if cutlass.const_expr(self.fused_topk):
                         if kv_pos < limit:
                             if score > sTheta[t]:
-                                if sCnt[(t, 0)] < TOP_K:
+                                if sCnt[(t, 0)] < self.top_k:
                                     slot = atom_add_u32(sCnt.iterator + (t * 4 + 0), Int32(1))
-                                    if slot < TOP_K:
+                                    if slot < self.top_k:
                                         sHeapV[(t, slot)] = score
                                         sHeapI[(t, slot)] = kv_pos
                                     else:
                                         s2 = atom_add_u32(sCnt.iterator + (t * 4 + 1), Int32(1))
-                                        if s2 < OVF_CAP:
+                                        if s2 < self.ovf_cap:
                                             sOvfV[(t, s2)] = score
                                             sOvfI[(t, s2)] = kv_pos
                                 else:
                                     s2 = atom_add_u32(sCnt.iterator + (t * 4 + 1), Int32(1))
-                                    if s2 < OVF_CAP:
+                                    if s2 < self.ovf_cap:
                                         sOvfV[(t, s2)] = score
                                         sOvfI[(t, s2)] = kv_pos
                     else:
@@ -842,7 +847,7 @@ class Fp4PagedMQALogits:
                         cute.arch.store(dbg_ptr + 96 + i, f32_as_i32(sW[0]), sem="relaxed", scope="sys")
                     if tidx < self.q_len:
                         sFlags[tidx] = sel_i32(
-                            sCnt[(tidx, 1)] >= OVF_TRIGGER, Int32(1), Int32(0)
+                            sCnt[(tidx, 1)] >= self.ovf_trigger, Int32(1), Int32(0)
                         )
                     sW_barrier.arrive_and_wait()
                     for t in range(self.q_len):
@@ -883,7 +888,7 @@ class Fp4PagedMQALogits:
         self, t, tidx, sHeapV, sHeapI, sOvfV, sOvfI,
         sScrAV, sScrAI, sBins, sAux, sCnt, sTheta, bar,
     ):
-        """Exact top-TOP_K of heap[0:TOP_K] + ovf[0:ovf_cnt] back into heap,
+        """Exact top-top_k of heap[0:top_k] + ovf[0:ovf_cnt] back into heap,
         theta = new heap min. Byte-wise radix select (4 passes over key bytes);
         boundary-bin entries are NOT copied — later passes re-scan the source
         with a high-bit prefix filter (saves smem and the read/write race)."""
@@ -891,9 +896,9 @@ class Fp4PagedMQALogits:
             sCnt[(t, 2)] = Int32(0)  # out_cnt (atomic slot for sScrA)
             sCnt[(t, 3)] = sCnt[(t, 3)] + Int32(1)  # merge counter (debug)
         bar.arrive_and_wait()
-        total = TOP_K + sCnt[(t, 1)]
+        total = self.top_k + sCnt[(t, 1)]
         iters = (total + 127) // 128
-        remaining = Int32(TOP_K)
+        remaining = Int32(self.top_k)
         prefix = Int32(0)
         for p in range(4):
             shift = (3 - p) * 8
@@ -907,10 +912,10 @@ class Fp4PagedMQALogits:
                     j = it * 128 + tidx
                     v = Float32(0.0)
                     if j < total:
-                        if j < TOP_K:
+                        if j < self.top_k:
                             v = sHeapV[(t, j)]
                         else:
-                            v = sOvfV[(t, j - TOP_K)]
+                            v = sOvfV[(t, j - self.top_k)]
                         key = f32_sort_key(v)
                         ok = cutlass.Boolean(True)
                         if p > 0:
@@ -942,12 +947,12 @@ class Fp4PagedMQALogits:
                     v = Float32(0.0)
                     ix = Int32(0)
                     if j < total:
-                        if j < TOP_K:
+                        if j < self.top_k:
                             v = sHeapV[(t, j)]
                             ix = sHeapI[(t, j)]
                         else:
-                            v = sOvfV[(t, j - TOP_K)]
-                            ix = sOvfI[(t, j - TOP_K)]
+                            v = sOvfV[(t, j - self.top_k)]
+                            ix = sOvfI[(t, j - self.top_k)]
                         key = f32_sort_key(v)
                         ok = cutlass.Boolean(True)
                         if p > 0:
@@ -959,9 +964,9 @@ class Fp4PagedMQALogits:
                                 sScrAV[slot] = v
                                 sScrAI[slot] = ix
                             elif p == 3 and bin_i == bnd:
-                                # exact-key tie: fill up to TOP_K
+                                # exact-key tie: fill up to self.top_k
                                 slot = atom_add_u32(sCnt.iterator + (t * 4 + 2), Int32(1))
-                                if slot < TOP_K:
+                                if slot < self.top_k:
                                     sScrAV[slot] = v
                                     sScrAI[slot] = ix
                 if p < 3:
@@ -969,12 +974,12 @@ class Fp4PagedMQALogits:
                 bar.arrive_and_wait()
                 remaining = remaining - c_gt
         # selected set (sScrA) -> heap; theta = heap min
-        for it in cutlass.range(TOP_K // 128, unroll=1):
+        for it in cutlass.range(self.top_k // 128, unroll=1):
             j = it * 128 + tidx
             sHeapV[(t, j)] = sScrAV[j]
             sHeapI[(t, j)] = sScrAI[j]
         m = Float32(float("inf"))
-        for it in range(TOP_K // 128):
+        for it in range(self.top_k // 128):
             v = sHeapV[(t, it * 128 + tidx)]
             m = sel_f32(v < m, v, m)
         sScrAV[tidx] = m
@@ -996,7 +1001,7 @@ class Fp4PagedMQALogits:
         for t in range(self.q_len):
             if b == 0 and tidx == 0:
                 nc = cute.arch.grid_dim()[0]
-                base = (t * nc + chunk) * 4
+                base = 128 + (t * nc + chunk) * 4  # 0-2 reserved for warp markers
                 cute.arch.store(dbg_ptr + base + 0, sCnt[(t, 0)], sem="relaxed", scope="sys")
                 cute.arch.store(dbg_ptr + base + 1, sCnt[(t, 1)], sem="relaxed", scope="sys")
                 cute.arch.store(dbg_ptr + base + 2, sCnt[(t, 3)], sem="relaxed", scope="sys")
@@ -1004,11 +1009,11 @@ class Fp4PagedMQALogits:
 
             total = sCnt[(t, 0)] + sCnt[(t, 1)]
             if tidx == 0:
-                sFlags[t] = sel_i32(total > TOP_K, Int32(1), Int32(0))
+                sFlags[t] = sel_i32(total > self.top_k, Int32(1), Int32(0))
             bar.arrive_and_wait()
             if sFlags[t] == 1:
                 # pad partially-filled heap with -inf, then exact merge
-                for it in cutlass.range(TOP_K // 128, unroll=1):
+                for it in cutlass.range(self.top_k // 128, unroll=1):
                     j = it * 128 + tidx
                     if j >= sCnt[(t, 0)]:
                         sHeapV[(t, j)] = Float32(-float("inf"))
@@ -1020,14 +1025,14 @@ class Fp4PagedMQALogits:
                 )
             else:
                 # everything fits: append overflow into heap
-                for it in cutlass.range(OVF_CAP // 128, unroll=1):
+                for it in cutlass.range(self.ovf_cap // 128, unroll=1):
                     j = it * 128 + tidx
                     if j < sCnt[(t, 1)]:
                         sHeapV[(t, sCnt[(t, 0)] + j)] = sOvfV[(t, j)]
                         sHeapI[(t, sCnt[(t, 0)] + j)] = sOvfI[(t, j)]
                 bar.arrive_and_wait()
-            out_n = cutlass.min(total, Int32(TOP_K))
-            for it in cutlass.range(TOP_K // 128, unroll=1):
+            out_n = cutlass.min(total, Int32(self.top_k))
+            for it in cutlass.range(self.top_k // 128, unroll=1):
                 j = it * 128 + tidx
                 if j < out_n:
                     mCandV[(b, t, chunk, j)] = sHeapV[(t, j)]
@@ -1056,11 +1061,12 @@ def run_fp4_paged_mqa_logits(
     blocks_per_chunk: int,
     num_kv_stage: int = 8,
     seq_lens: torch.Tensor | None = None,  # (B,) int32 — fused_topk masking
-    cand_v: torch.Tensor | None = None,  # (B, q_len, n_chunks, TOP_K) fp32
-    cand_i: torch.Tensor | None = None,  # (B, q_len, n_chunks, TOP_K) int32
+    cand_v: torch.Tensor | None = None,  # (B, q_len, n_chunks, top_k) fp32
+    cand_i: torch.Tensor | None = None,  # (B, q_len, n_chunks, top_k) int32
     cand_c: torch.Tensor | None = None,  # (B, q_len, n_chunks) int32
     dbg: torch.Tensor | None = None,  # (8,) int32 progress markers
     stream: cuda.CUstream | None = None,
+    top_k: int = DEFAULT_TOP_K,
 ) -> None:
     num_pages, B = kv_fused.shape[0], q_packed.shape[0]
     N = q_packed.shape[1]
@@ -1068,6 +1074,8 @@ def run_fp4_paged_mqa_logits(
     max_pages = block_table.shape[1]
     n_chunks = max_pages // blocks_per_chunk
     fused_topk = cand_v is not None
+    if fused_topk:
+        assert cand_v.shape[-1] == top_k and cand_i.shape[-1] == top_k
     if dbg is None:
         dbg = torch.zeros(8, dtype=torch.int32, device=kv_fused.device)
     if seq_lens is None:
@@ -1078,13 +1086,14 @@ def run_fp4_paged_mqa_logits(
         cand_v = logits  # unused placeholders
         cand_i = block_table
         cand_c = block_table
-    key = (N, q_len, blocks_per_chunk, num_kv_stage, fused_topk)
+    key = (N, q_len, blocks_per_chunk, num_kv_stage, fused_topk, top_k)
     if key not in _compile_cache:
         kernel = Fp4PagedMQALogits(
             n_heads=N // q_len,
             q_len=q_len,
             num_kv_stage=num_kv_stage,
             fused_topk=fused_topk,
+            top_k=top_k,
         )
         compiled = cute.compile(
             kernel,
