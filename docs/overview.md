@@ -20,7 +20,8 @@ DeepSeek V4 DSA（DeepSeek Sparse Attention）decode 的 megakernel 实现：把
 | vLLM PR #44573 | V4 DCP decode 未合并实现（gatherQ + FlashMLA + A2A）。实测 DCP4 比 TP4 **慢 35-39%**（<128K 上下文），128K 才转正。每层 2-7 次 eager NCCL，每步 150-300+ 次；C4A decode 索引映射疑似有 bug；DSpark 不安全 |
 | sglang | DSA CP 是独立开关但**只管 prefill**（KV 全复制，decode 各 rank 冗余计算，零 CP 通信）；普通 DCP 不接 DSA 后端，且 CUDA 上 DCP+投机只允许 Kimi Linear |
 | vllm-ascend | 三种形态：token 分片 DSA-CP（KV 复制，计算÷cp，权重复制）；SFA DCP（KV 分片 + indexer 复制 + remap）；fused lightning_indexer（logits+topk 单 kernel）已产品化；MTP draft 步间 topk 复用（skip_topk/IndexCache） |
-| flashinfer PR #3943 | CuTe DSL HCA kernel（V4 sparse MLA decode，SWA 128 窗口 + 128:1 压缩双池，fp8，128 head，512 latent，2-CTA cluster，warp 专用化，persistent 可选，q_len>1 支持）；**无跨卡通信**，topk 外部输入 |
+| TRT-LLM blog26（V4 on Blackwell） | V4 三层型定义：ratio 0=SWA-only、4=CSA（**entry 级 top-k + gather**，topk=512 Flash/1024 Pro）、128=HCA（dense 全量、无 indexer）；CSA 层双压缩流（attention KV + indexer-K 同坐标系）；**MXFP4 index-K 是 TRT-LLM 默认**（"FP4 approximately halves the Indexer-K data payload"——佐证我们 FP4 决策）；压缩池页按 raw-token 坐标分配（tokens_per_block/r entry/页）；top-k 优化：radix/insertion 分派 + GVR 时序复用（相邻步选择重叠，1.4-2.17×）；compressor = softmax-gated pooling，CSA 两个相邻 4-token 组 8-token 感受野；attn_sink checkpoint 自带 |
+| flashinfer PR #3943 | CuTe DSL HCA kernel（V4 sparse MLA decode，SWA 128 窗口 + 压缩池双池，fp8，128 head，512 latent，2-CTA cluster，16 warp 专用化，persistent 可选，q_len>1 支持）；**页粒度 dense-prefix 枚举**（`sparse_topk_lens` 前缀掩码，无 scattered topk）；**无跨卡通信**，选择外部物化为页表输入 |
 | sglang #26209/#27059/#30546 | FP4（MXFP4）indexer 数据：index-K 132B→68B/token/层（-48%，+9.9% KV 容量），logits kernel 1.49-1.53×（SM100 L=8K/32K），E2E +6-8%，精度 GSM8K -1.5pt / GPQA ~0；sglang 做成 opt-in 默认关（产品保守）；kernel 在 DeepGEMM（`fp8_fp4_paged_mqa_logits`） |
 | flashinfer cutedsl_megamoe | CuTe DSL 多卡 megakernel 完整范式：symm-mem + peer offset 映射 + sense-reversing barrier + TMA pull/red.sys push |
 | tirx-kernels | megakernel DSL（TIRx/TVM）：persistent kernel + packed task 队列（静态/动态 MPMC）+ etensor 两阶段 notify；bs1 收益 1.66x；先手写后 DSL 的工程路线 |
@@ -36,6 +37,27 @@ DeepSeek V4 DSA（DeepSeek Sparse Attention）decode 的 megakernel 实现：把
 - token 分片（Ascend DSA-CP）会复制 attention 权重（权重流量 ×cp），decode 中小 batch 下是负优化，只适合 prefill/超大 batch
 - KV 分片保持权重 TP 切分不变，计算和显存同时 ÷cp
 - 二维 (token×KV) 分解留接口不实现（cp≥16 时控制候选交换载荷用）
+
+## C4A 选择粒度决策：entry 粒度（与官方一致）+ HCA fork 双模式消费
+
+三方调研互证（2026-08-03 确认）：
+- **sglang/vllm 的 C4A 是 entry 粒度**：indexer 在 S/4 个 C4 entry 打分上 topk-512/1024（sglang `_topk_transform_512_vectorized` 输出 `physical_page << page_bits | offset` 的 entry 级物理索引；vllm `topk_indices_buffer` 同），注意力走 **FlashMLA sparse 逐 entry gather**（`flash_mla_with_kvcache` + `extra_indices`）
+- **C128A 无学习选择**：dense 全量压缩条目（vllm `build_c128a_topk_metadata` 从 positions 推导槽位列表 + 计数，**indexer 不参与 C128A 层**——这些层没有 logits/topk tile）；sglang 同（`c128_page_indices` 位置推导）
+- **flashinfer HCA（cute_dsl hca_fp8.py）是页粒度 dense-prefix 枚举**：压缩池按页表整页 TMA 装载，`sparse_topk_lens` 只做逻辑前缀掩码，选择必须以"页表列哪些页"物化
+
+**决策：C4A 选择保持 entry 粒度（与官方语义完全一致），放弃页粒度作为 baseline。** V4 index_topk = 512（Flash）/1024（Pro）（sglang `configs/deepseek_v4.py:60`、TRT-LLM blog26；注意不是 V3.2 的 2048），cand 格式 = (logit fp32, entry_id u32)。理由：页粒度 CSA 选择是公开未验证语义（见下「风险确认」），研究 baseline 必须与 sglang/vllm/TRT-LLM 的 entry 级 top-k 对齐，否则 E2E 数值对拍失去意义；页粒度降级为后续 ablation（做完 exact baseline 后受控实验，量化 recall 差）。
+
+attention 消费形态（保证 fork 计划不受回退影响）：
+- **C128A + SWA-only 层：fork HCA 页枚举**——dense 全量，页枚举 = 精确语义，零风险
+- **CSA 层：同一个 HCA fork 的 gather 模式**——cmp 流 `page_size_cmp=1`（每 entry 512B fp8，满足 TMA 128B 对齐；原版 `can_implement` 拒 page_size≤1 是其通用布局保守，我们放开），**cand merge 产出的 entry id 列表直接当 1-entry 页的页表**，无格式转换。代价是每 k-tile 128 次 512B TMA（vs 页版 8 次 8KB），字节数相同，损失的是空间局部性与 TMA 发射开销；`load_tma_qk_one_k_tile` 需按页 chunk 重构（k_idx 寄存器张量 128×4B 超预算，改 8 个一批流水）。若 TMA gather 效率不达标，备用方案是 FlashMLA sparse 式 LDGSTS gather（V3.2 路线）
+- **通信**：候选回到 entry 级（见下表）；层级 topk 归并语义与官方完全一致（合并 entry 列表）
+
+**风险确认（2026-08-03 调研，回退依据）：页粒度 CSA 选择是公开未验证语义。** ①flashinfer PR #3943 全文未讨论精度问题——它只把 page-aligned 当 ABI 门槛（`hca_sparse_indices_format="page-aligned"` 显式拒绝 arbitrary sparse token selections），entry 粒度的 TRTLLM-GEN 路径仍是默认，benchmark 只在同一 page-aligned 表上双后端对拍（max diff 0.0039），从未比较"页粒度选择 vs entry 粒度选择"；review 无人工讨论（全 bot）。②TRT-LLM blog26 明确写 CSA = entry 级 top-k + **gather**（"gathers selected CSA entries"、"Selected compressed positions are converted to token-level global addresses"），其 Top-K 优化（radix/insertion、GVR 时序复用）也全在 entry 坐标上。即所有生产路径（sglang/vllm/TRT-LLM）都是 entry 粒度。结论：baseline 必须 entry 粒度；页粒度作为后续 ablation 时，用 1.1 参考路径在 torch 级量化 recall（entry-topk vs 页 max-topk 的集合重合度 + attention out 偏差）。
+
+影响：
+- **1.1 改造点（1.1b）**：topk K 对齐 V4 官方（512/1024，堆容量从 2048 右尺寸化到 1024 释放 smem）；cand 格式 = (logit fp32, entry_id u32)，**entry 粒度不变**
+- **attention tile（1.2）= fork `hca_fp8.py`**：CSA 层 cmp 流 gather 模式（page_size=1，entry id 列表即页表）；C128A 变体页表位置推导（dense 页枚举）；**第三种层型 SWA-only（ratio 0，Flash 前两层）= cmp 池为空的退化变体**（TRT-LLM blog26 三层型定义）
+- **通信清单**：候选行回到 entry 粒度（见下表）
 
 ## indexer 精度决策：直接 FP4（MXFP4），不留 FP8 旋钮
 
@@ -71,13 +93,13 @@ megakernel 独有：
 
 | 数据 | 量级 | 传输 |
 |---|---|---|
-| topk 候选 (logit, 条目id) 对，**压缩条目/页粒度** | ~128KB | multimem.st allgather（无 NVLS → cp-1 次 TMA push） |
+| topk 候选 (logit, entry_id) 对，**entry 粒度**（512/1024 entry/query，4-8KB/query） | ~256-512KB（B=32,q=2） | multimem.st allgather（无 NVLS → cp-1 次 TMA push） |
 | LSE 标量 | ~32KB | multimem.st allgather |
 | LSE partials（**fp32 直通**，不做降级转换；W_UV-before-merge 后 128/head） | ~4MB（最大头） | multimem.ld_reduce 归约（fallback TMA pull + 本地加）；按 head 分 chunk 流水 |
 | q | **不交换**（hidden states 在 attention 侧复制，#44573 gatherQ 是反例） | — |
 | 新 token KV/indexer 写入 | KB 级 | 纯本地（owner=token%cp，本地算本地写） |
 
-关键决策：跨卡**零 indexed gather**——选中 KV 的覆盖靠"attention 留本地 + LSE 合并"（V3.2 DCP 语义），index 只作为稠密候选数组的内容传输。attention 本地读取（HCA 范式，flashinfer hca_fp8.py）：双池（SWA 窗 + 压缩池）page table + TMA tile load，稠密枚举 + per-query 有效长度掩码（`sparse_mla_topk_lens`）；选择在选择物化为页索引（sglang 页粒度，64 对齐 page_bits 编码）或位置推导（C128A 零 topk 通信）。
+关键决策：跨卡**零 indexed gather**——选中 KV 的覆盖靠"attention 留本地 + LSE 合并"（V3.2 DCP 语义），index 只作为稠密候选数组的内容传输。attention 本地读取（HCA 范式，flashinfer hca_fp8.py）：双池（SWA 窗 + 压缩池）page table + TMA tile load，稠密枚举 + per-query 有效长度掩码（`sparse_mla_topk_lens`）；选择物化为 **entry 级索引列表**（CSA：topk-512/1024 entry，merge 树产出，attention 以 page=1 gather 消费；C128A：dense 位置推导，零 topk 零 logits）。注：CSA 的 entry 粒度语义与 sglang/vllm/TRT-LLM 生产路径完全一致；页粒度仅作后续 ablation。
 
 ## 实验协议（固定 shape）
 
@@ -92,7 +114,7 @@ megakernel 独有：
 图拓扑（任务类型、通信边、事件表、buffer 布局）从骨架阶段**冻结**；cp=1 与 cp=k 是同一幅图的两种执行，通信任务在 cp=1 下退化但仍在图中，不存在后期追加边。
 
 - **Phase 0 骨架**：0.1 event 系统（见 event-system.md，已验收）→ 0.2 静态队列调度器（**已验收**：`mega_dsa_cp/schedule/{codegen,device}.py`——codegen 把校验过的单层 DAG 拓扑序发牌成每 CTA packed 队列（header + 3 坐标 + 内联 wait/notify 边，wait≤63/notify≤63），设备端 smem 暂存 + cursor 遍历 + scope 分派 wait + 单发射者 notify + 动态上界标量读取；CPU 30 随机 DAG + 多 rank 对称性过，单卡 512 任务×2 种子×2 相位过，双卡跨 rank DAG×2 相位过）→ 0.3 通信原语+buffer 布局（**已验收**：`mega_dsa_cp/comm/{primitives,device,buffers}.py`——bulk S2G push（`cp.async.bulk` 1D + commit/wait + `fence.proxy.async.global` + notify 链）、`multimem.st` allgather、`multimem.ld_reduce` fp32 交换机归约、SymmetricArena 命名区域×相位轮换；双卡 2 相位全过，NVLS multicast 在 Modal B200:2 可用）→ 0.4 空壳 pipeline cp=2 端到端（**骨架已冻结**：`tests/test_skeleton_cp2.py`——30 任务/rank、14 事件的全拓扑过调度器；候选 128KB multimem.st allgather 校验、partials 4MB（16×256KB）smem→bulk push 到 owner inbox 双 rank 校验、2 相位单调复用全过；热态 wall 566µs/层（stub 算子 + 真实通信量），冷启动 6.9ms）**Phase 0 完成**
-- **Phase 1 计算 tile**（图不变，cp=1 退化执行下对数值）：1.1 logits+topk 融合（**FP4 MXFP4 打分**，mxf4 UMMA + 局部 top-K 候选堆，logits 不落 HBM）→ 1.2 attention（HCA 改造）→ 1.3 compressor（含 FP4 量化写 index-K）→ 1.4 通信任务实现 → 1.5 GEMM tiles
+- **Phase 1 计算 tile**（图不变，cp=1 退化执行下对数值）：1.1 logits+topk 融合（**FP4 MXFP4 打分**，mxf4 UMMA + 局部 top-K 候选堆，logits 不落 HBM）→ 1.1b topk K 对齐 V4（**已验收**：`top_k` 编译期参数 512/1024，堆/overflow/scratch 容量 1:1 右尺寸化（q_len=2 省 ~40KB smem），Modal 双 K 全过：values OK + 索引重合 1.0000，merge 路径真实触发 K=512→3 次/chunk、K=1024→2 次/chunk）→ 1.2 attention（**fork flashinfer hca_fp8.py**，砍 persistent/split-KV/host 侧，保留双流 TMA 视图 + 7 pipeline + 双 softmax 组；CSA cmp 流改 page=1 gather 模式）→ 1.3 compressor（含 FP4 量化写 index-K）→ 1.4 通信任务实现 → 1.5 GEMM tiles
 - **Phase 2 跨卡执行**：cp=2→4→8，数值双参照（自身 cp=1 + vLLM TP），性能实验矩阵
 - **Phase 3（可选）**：DSL 化（tirx 方法论：队列字节等价+数值等价）、动态 MPMC 调度、2D 分解
 
