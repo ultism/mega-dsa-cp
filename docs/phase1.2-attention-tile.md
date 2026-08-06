@@ -55,3 +55,25 @@ skeleton 的 attn(s,h) 16 stub 修订为 **attn(b,t) = B×q_len 个实体任务*
 3. 掩码：window_valid_len <128、K_valid 截断、attn_sink、spec q_len=2 逐行因果
 4. LSE log2 域校验；O/LSE partials 布局与 0.4 通信 stub 对齐
 5. Modal `phase12_single` 入口；数值对拍记录进本文档
+
+## 验收结果（2026-08-06，Modal B200，5/5 PASS）
+
+standalone v1 全绿（`tests/test_hca.py`，`modal run scripts/modal_app.py::phase12_single`）：
+
+| case | 内容 | O vs online-sim | LSE |
+| --- | --- | --- | --- |
+| tiny-c128a | 单 batch 单 tile + 死锁标记轮询 | 7.7e-1 ✓ | 3.9e-3 ✓ |
+| c128a-nosink | B=4 q_len=2，S∈{4396,100,8229,2048} 变长（含 S<128 窗口残缺） | 8.0e-1 ✓ | 4.9e-3 ✓ |
+| c128a-sink | 同上 + 有限 attn_sink | 8.0e-1 ✓ | 4.9e-3 ✓ |
+| csa-gather | page_size=1 gather，topk-512 合成 entry 列表（5 k-tile） | 1.1 ✓ | 7.3e-3 ✓ |
+| c128a-partials | acc_o/acc_lse partials 路径（0.4 stub 布局） | 1.1 ✓ | 7.8e-3 ✓ |
+
+补充验证：C128A 4-tile（S=33K）、CSA 2-tile、CSA 5-tile（seed 变体）均过——gather 模式与 tile 数无系统性问题。
+
+**验收方法关键**：torch 参考必须用**在线 softmax 模拟**（`ref_hca_online`：逐 tile running max + 每 tile fp8 P 量化 + exp2 校正 rescale）；naive final-max fp8P 参考有系统性单边差异（gotcha #34）。残余差是 ex2.approx 引发的 fp8 边界翻转，容差 rtol/atol 2e-2（|V|≤448 raw 下）。
+
+**调试过程两个根因**（详见 gotcha #33）：
+1. launch error 9（两天）= `grid.z` 用了 fake tensor 动态维度，marshal 解析为 0（NVIDIA/cutlass#2794）→ **全部静态形状编译**（`run_hca_fp8` 的 fakes 用真实 tensor 维度，cache key 含全维度）
+2. XID 13 = 垃圾 stride 导致的非法 TMA 描述符，随静态化一并消失
+
+**目前与设计的出入**：无功能性出入；V gather 的 dst 槽位按 `i_sub = slot // 64` 子块映射（pv tiler (128,256) 下每 pv_k 迭代 64 槽）。

@@ -128,6 +128,13 @@ def phase11_single() -> None:
     _run(["python", "tests/test_logits_fp4.py", "--topk"], timeout=420)
 
 
+@app.function(gpu="B200", image=image, timeout=1800, retries=0)
+def phase12_single() -> None:
+    """Phase 1.2 single-GPU: HCA fork vs torch dual-pool reference."""
+    _run(["nvidia-smi"])
+    _run(["python", "tests/test_hca.py"], timeout=1500)
+
+
 @app.function(gpu="B200:2", image=image, timeout=900, retries=0)
 def phase03_dual() -> None:
     """Phase 0.3 dual-GPU: bulk push + multimem primitives."""
