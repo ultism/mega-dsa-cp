@@ -73,7 +73,7 @@ standalone v1 全绿（`tests/test_hca.py`，`modal run scripts/modal_app.py::ph
 **验收方法关键**：torch 参考必须用**在线 softmax 模拟**（`ref_hca_online`：逐 tile running max + 每 tile fp8 P 量化 + exp2 校正 rescale）；naive final-max fp8P 参考有系统性单边差异（gotcha #34）。残余差是 ex2.approx 引发的 fp8 边界翻转，容差 rtol/atol 2e-2（|V|≤448 raw 下）。
 
 **调试过程两个根因**（详见 gotcha #33）：
-1. launch error 9（两天）= `grid.z` 用了 fake tensor 动态维度，marshal 解析为 0（NVIDIA/cutlass#2794）→ **全部静态形状编译**（`run_hca_fp8` 的 fakes 用真实 tensor 维度，cache key 含全维度）
+1. launch error 9（两天）= `grid.z` 用了 fake tensor 动态维度，marshal 解析为 0（NVIDIA/cutlass#2794）→ **按 S-bucket 全静态编译**：Q 侧固定（B、q_len），KV 侧 S 动态由 **bucket 容量**池/页表 + `k_valid`/`win_valid` 设备标量截断承担（拓扑静态、标量动态）；grid 不含 S；cache key 的 pages/cols 即 bucket 容量——**不是按精确 S 逐个编译**。调用契约：池与页表按 bucket 容量分配，装载只触达有效页（末 tile 越界槽位为池内陈旧有限值，掩码兜底）
 2. XID 13 = 垃圾 stride 导致的非法 TMA 描述符，随静态化一并消失
 
 **目前与设计的出入**：无功能性出入；V gather 的 dst 槽位按 `i_sub = slot // 64` 子块映射（pv tiler (128,256) 下每 pv_k 迭代 64 槽）。

@@ -3185,9 +3185,13 @@ def run_hca_fp8(
         dbg = torch.zeros(8, dtype=torch.int32, device=q.device)
     if stream is None:
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    # All-static compilation: deployment uses fixed shapes, and dynamic-shape
-    # marshalling is broken (NVIDIA/cutlass#2794: dims resolve to 0, strides
-    # garbage at runtime -> grid.z=0 killed our first launch with error 9).
+    # All-static compilation per S-bucket: Q side fixed (B, q_len); KV side
+    # dynamic-S handled by bucket-capacity pools/page tables + device-scalar
+    # k_valid/win_valid masking (拓扑静态、标量动态). Callers must allocate
+    # kv pools and page tables at bucket capacity; grid carries no S. Dynamic
+    # shape marshalling is broken (NVIDIA/cutlass#2794: dims resolve to 0,
+    # strides garbage at runtime -> grid.z=0 killed our first launch with
+    # error 9), hence no sym dims anywhere.
     key = (T, page_cmp, page_win, B, pages_win, pages_cmp, rows, cols,
            acc_o is not None)
     if key not in _COMPILE_CACHE:
