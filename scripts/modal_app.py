@@ -15,6 +15,7 @@ Logs: `modal run ... 2>&1 | tee log/<task>.log`.
 """
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -46,7 +47,7 @@ image = (
 )
 
 
-def _run(cmd: list[str], timeout: int = 300) -> None:
+def _run(cmd: list[str], timeout: int = 300, env: dict | None = None) -> None:
     """Run one command with a HARD timeout.
 
     Kernel execution is seconds; JIT compiles are ~40-60s each. Any command
@@ -55,7 +56,8 @@ def _run(cmd: list[str], timeout: int = 300) -> None:
     keeps Modal from re-running the whole suite after a kill.
     """
     print(f"+ {' '.join(cmd)}", flush=True)
-    subprocess.run(cmd, check=True, cwd="/root/mega-dsa-cp", timeout=timeout)
+    subprocess.run(cmd, check=True, cwd="/root/mega-dsa-cp", timeout=timeout,
+                   env={**os.environ, **(env or {})})
 
 
 @app.function(gpu="B200", image=image, timeout=600)
@@ -133,6 +135,53 @@ def phase12_single() -> None:
     """Phase 1.2 single-GPU: HCA fork vs torch dual-pool reference."""
     _run(["nvidia-smi"])
     _run(["python", "tests/test_hca.py"], timeout=1500)
+
+
+@app.function(gpu="B200", image=image, timeout=900, retries=0)
+def phase13_probe() -> None:
+    """Phase 1.3 compile-only probe (single GPU)."""
+    _run(["python", "tests/probe_compress_compile.py"], timeout=600)
+
+
+@app.function(gpu="B200:2", image=image, timeout=900, retries=0)
+def phase13_debug_nopush() -> None:
+    """Phase 1.3 short roll, push disabled, finalize runs (bisect)."""
+    _run(
+        ["torchrun", "--nproc_per_node=2", "tests/test_compress.py", "6", "nopush"],
+        timeout=600,
+        env={"VERBOSE": "1"},
+    )
+
+
+@app.function(gpu="B200:2", image=image, timeout=900, retries=0)
+def phase13_debug_nofin() -> None:
+    """Phase 1.3 short roll, step kernels only (bisect)."""
+    _run(
+        ["torchrun", "--nproc_per_node=2", "tests/test_compress.py", "6", "nofin"],
+        timeout=600,
+        env={"VERBOSE": "1"},
+    )
+
+
+@app.function(gpu="B200:2", image=image, timeout=900, retries=0)
+def phase13_debug() -> None:
+    """Phase 1.3 short verbose roll (debug)."""
+    _run(
+        ["torchrun", "--nproc_per_node=2", "tests/test_compress.py", "6"]
+        + (["nofin"] if os.environ.get("NOFIN") else []),
+        timeout=600,
+        env={"VERBOSE": "1", "TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC": "120"},
+    )
+
+
+@app.function(gpu="B200:2", image=image, timeout=1800, retries=0)
+def phase13_dual() -> None:
+    """Phase 1.3 dual-GPU: CP-native compressor (CSA dual-stream + C128A)."""
+    _run(["nvidia-smi"])
+    _run(
+        ["torchrun", "--nproc_per_node=2", "tests/test_compress.py"],
+        timeout=1500,
+    )
 
 
 @app.function(gpu="B200:2", image=image, timeout=900, retries=0)
