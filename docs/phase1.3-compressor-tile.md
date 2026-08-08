@@ -71,6 +71,10 @@ entry n 在 step t 关闭、finalize 完成 → **step t+1 起**对 logits/attn 
 
 产出：`mega_dsa_cp/tiles/compress.py`（partial + finalize + torch 参考）、`tests/test_compress.py`、Modal `phase13_dual` 入口。
 
+## 4.5 TRT-LLM 生产路径印证（blog26 "Compressor optimizations" 段，2026-08-08）
+
+blog26 全文（`tmp/trtllm_blog26.html.md`）确认生产 compressor = 三边界融合：wkv_gate 单投影同产 KV+score；压缩+状态更新单 kernel；**后处理单 kernel = RMSNorm + RoPE + optional Hadamard + 量化 + scatter 写池**——与我们 finalize 链逐项对应，**Hadamard 在生产路径中确认存在**（"optional Hadamard transform"）。另：生产记录输入为 BF16（FP32 状态更新），我们的 step kernel 当前是 FP32 输入——集成时（1.5 wkv_gate 对接）需加 BF16 记录读路径。精度表另确认：attention KV cache 为 **per-tensor FP8**（合我们 1.2 无 per-entry scale 布局）、Index-K cache MXFP4 为 Blackwell 默认、compressor state FP32（合我们 stats 设计）。
+
 ## 5. 验收结果（`phase13_dual`，300 步 × B=8 × cp=2）
 
 - micro bit-gates：staged Hadamard 与 MXFP4 量化对 torch 参考**逐位一致**
