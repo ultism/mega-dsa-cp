@@ -156,8 +156,13 @@ def _csa_step_kernel(
         cute.arch.store(ring_idx + (b * RING + slot) * REC_IDX + o, v)
     cute.arch.barrier()
 
-    closed = ((pos + 1) & 3) == 0
-    n = pos >> 2  # closing group index (meaningful only when closed)
+    # a group closes on THIS step if any of this step's positions completes
+    # it (q_len=2): both ranks must compute+push partials for that group,
+    # not just the rank holding the closing token.
+    c0 = ((s + 1) & 3) == 0
+    c1 = ((s + 2) & 3) == 0
+    closed = c0 | c1
+    n = (s + sel_i32(c0, Int32(0), Int32(1))) >> 2  # closing group index
 
     smem = cutlass.utils.SmemAllocator()
     s_stats = smem.allocate_tensor(Float32, CSA_STATS_F32, byte_alignment=16)
@@ -225,7 +230,10 @@ def _csa_step_kernel(
     cute.arch.barrier()
     cute.arch.fence_view_async_shared()
 
-    # 4. push payload to the owner rank (only on close), notify both cells
+    # 4. push payload to the owner rank (only on close), notify both cells.
+    # notify at TOP LEVEL (self-guards to thread 0): nesting it after a
+    # dynamic region inside `if tidx==0` mis-stages and drops the peer
+    # notify on the close path (Phase 0 tests use this exact shape).
     if tidx == 0:
         if closed:
             if do_push != 0:
@@ -238,8 +246,8 @@ def _csa_step_kernel(
                 )
                 push_start(dst, s_stats.iterator, Int32(CSA_STATS_BYTES))
                 push_finish()
-        events.notify(Int32(b), Int32(0))
-        events.notify(Int32(b), Int32(1))
+    events.notify(Int32(b), Int32(0))
+    events.notify(Int32(b), Int32(1))
 
 
 @cute.jit
@@ -294,6 +302,7 @@ def _csa_finalize_kernel(
     k_valid: cute.Pointer,  # i32 (B,)
     dbg_attn: cute.Pointer,  # f32 (B, MAXE, HD_ATTN) merged fp32 (pre-norm)
     dbg_idx: cute.Pointer,  # f32 (B, MAXE, HD_IDX)
+    do_body: Int32,
     max_e: cutlass.Constexpr,
 ):
     tidx, _, _ = cute.arch.thread_idx()
@@ -320,7 +329,7 @@ def _csa_finalize_kernel(
     owner = n & (CP - 1)
 
     if closed:
-        if owner == my_rank:
+        if (owner == my_rank) & (do_body != 0):
             src0 = pbuf.peer_ptr(
                 stats_off + (b * CP) * CSA_STATS_BYTES, my_rank, Float32,
                 align=16,
@@ -359,8 +368,10 @@ def _csa_finalize_kernel(
             if (tidx & 31) == 0:
                 s_red[tidx >> 5] = ssq
             cute.arch.barrier()
-            if tidx < 4:
-                v = s_red[tidx]
+            if tidx < 32:
+                # full-warp shuffle mask: all 32 lanes must participate
+                v = s_red[tidx & 3]
+                v = v * sel_f32(tidx < 4, Float32(1.0), Float32(0.0))
                 for off in (2, 1):
                     v = v + cute.arch.shuffle_sync_bfly(v, offset=off)
                 if tidx == 0:
@@ -426,8 +437,10 @@ def _csa_finalize_kernel(
             if (tidx & 31) == 0:
                 s_red[tidx >> 5] = ssqi
             cute.arch.barrier()
-            if tidx < 4:
-                v = s_red[tidx]
+            if tidx < 32:
+                # full-warp shuffle mask: all 32 lanes must participate
+                v = s_red[tidx & 3]
+                v = v * sel_f32(tidx < 4, Float32(1.0), Float32(0.0))
                 for off in (2, 1):
                     v = v + cute.arch.shuffle_sync_bfly(v, offset=off)
                 if tidx == 0:
@@ -533,12 +546,14 @@ def launch_csa_finalize(
     k_valid: cute.Pointer,
     dbg_attn: cute.Pointer,
     dbg_idx: cute.Pointer,
+    do_body: Int32,
     stream: cuda_drv.CUstream,
 ):
     _csa_finalize_kernel(
         seq_len, pay_base, pay_offsets, mc_base, stats_off, ev_base,
         ev_offsets, my_rank, phase, norm_w_attn, norm_w_idx, norm_eps, freqs,
-        inv_fp8_scale, cmp_pool, idxk_pool, k_valid, dbg_attn, dbg_idx, max_e,
+        inv_fp8_scale, cmp_pool, idxk_pool, k_valid, dbg_attn, dbg_idx,
+        do_body, max_e,
     ).launch(grid=[b_count, 1, 1], block=[N_THREADS, 1, 1], stream=stream)
 
 
@@ -571,9 +586,13 @@ def _c128_step_kernel(
 
     s = cute.arch.load(seq_len + b, Int32)
     pos = s + ((my_rank - s) & 1)
-    pic = pos & 127  # position in chunk
-    n128 = pos >> 7
-    closed = pic == 127
+    pic = pos & 127  # position in chunk (bias row for MY token)
+    # chunk closes on THIS step if any of this step's positions completes it;
+    # both ranks push their state for that chunk (closer != owner half the time)
+    c0 = ((s + 1) & 127) == 0
+    c1 = ((s + 2) & 127) == 0
+    closed = c0 | c1
+    n128 = (s + sel_i32(c0, Int32(0), Int32(1))) >> 7
 
     st_m = state + (b * 3 + 0) * HD_ATTN
     st_l = state + (b * 3 + 1) * HD_ATTN
@@ -617,8 +636,8 @@ def _c128_step_kernel(
             )
             push_start(dst, s_stats.iterator, Int32(C128_STATS_BYTES))
             push_finish()
-        events.notify(Int32(b_count + b), Int32(0))
-        events.notify(Int32(b_count + b), Int32(1))
+    events.notify(Int32(b_count + b), Int32(0))
+    events.notify(Int32(b_count + b), Int32(1))
 
 
 @cute.jit
@@ -728,8 +747,10 @@ def _c128_finalize_kernel(
             if (tidx & 31) == 0:
                 s_red[tidx >> 5] = ssq
             cute.arch.barrier()
-            if tidx < 4:
-                v = s_red[tidx]
+            if tidx < 32:
+                # full-warp shuffle mask: all 32 lanes must participate
+                v = s_red[tidx & 3]
+                v = v * sel_f32(tidx < 4, Float32(1.0), Float32(0.0))
                 for off in (2, 1):
                     v = v + cute.arch.shuffle_sync_bfly(v, offset=off)
                 if tidx == 0:

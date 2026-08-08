@@ -144,6 +144,16 @@ def phase13_probe() -> None:
 
 
 @app.function(gpu="B200:2", image=image, timeout=900, retries=0)
+def phase13_debug_nobody() -> None:
+    """Phase 1.3 short roll, finalize wait-only (bisect)."""
+    _run(
+        ["torchrun", "--nproc_per_node=2", "tests/test_compress.py", "6", "nobody"],
+        timeout=600,
+        env={"VERBOSE": "1"},
+    )
+
+
+@app.function(gpu="B200:2", image=image, timeout=900, retries=0)
 def phase13_debug_nopush() -> None:
     """Phase 1.3 short roll, push disabled, finalize runs (bisect)."""
     _run(
@@ -167,8 +177,7 @@ def phase13_debug_nofin() -> None:
 def phase13_debug() -> None:
     """Phase 1.3 short verbose roll (debug)."""
     _run(
-        ["torchrun", "--nproc_per_node=2", "tests/test_compress.py", "6"]
-        + (["nofin"] if os.environ.get("NOFIN") else []),
+        ["torchrun", "--nproc_per_node=2", "tests/test_compress.py"],
         timeout=600,
         env={"VERBOSE": "1", "TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC": "120"},
     )

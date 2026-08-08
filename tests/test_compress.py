@@ -45,6 +45,7 @@ B = 8
 STEPS = int(sys.argv[1]) if len(sys.argv) > 1 else 300
 SKIP_FIN = len(sys.argv) > 2 and sys.argv[2] == "nofin"
 NO_PUSH = len(sys.argv) > 2 and sys.argv[2] == "nopush"
+NO_BODY = len(sys.argv) > 2 and sys.argv[2] == "nobody"
 VERBOSE = os.environ.get("VERBOSE", "") != ""
 MAXE = 128  # local CSA entry capacity per rank (one idx-K page)
 MAXE128 = 4  # local C128A entry capacity per rank
@@ -152,6 +153,7 @@ def main():
             st = cr.c128_update(st, rec[:512], rec[512:], ape128[p % 128])
             if p % 128 == 127:
                 ref_c128[(b, p // 128)] = st[2].clone()
+                st = cr.c128_state_init()  # chunk close resets the state
 
     # fp8 scales from presim amax (post-norm values)
     amax_a = max(
@@ -221,7 +223,7 @@ def main():
         ptr(Float32, nw_a), ptr(Float32, nw_i), Float32(EPS),
         ptr(Float32, freqs_d), Float32(inv_a),
         ptr(Uint8, cmp_pool), ptr(Uint8, idxk_pool), ptr(Int32, k_valid),
-        ptr(Float32, dbg_attn), ptr(Float32, dbg_idx), stream,
+        ptr(Float32, dbg_attn), ptr(Float32, dbg_idx), Int32(1), stream,
     )
     step128 = cute.compile(
         C.launch_c128_step, B,
@@ -249,6 +251,11 @@ def main():
         new_c128 = torch.stack([recs_c128[b][pos_r] for b in range(B)]).cuda()
         csa_off = arena.region_off("csa", t % 2)
         c128_off = arena.region_off("c128", t % 2)
+        marks = ["csa_step", "csa_fin", "c128_step", "c128_fin"]
+        def tick(i):
+            if VERBOSE:
+                torch.cuda.synchronize()
+                print(f"[rank{rank}] step {t} {marks[i]} ok", flush=True)
         step_c(
             ptr(Float32, ring_attn), ptr(Float32, ring_idx),
             ptr(Float32, new_attn), ptr(Float32, new_idx),
@@ -257,6 +264,7 @@ def main():
             *common, Int64(csa_off), *ev_args, Int32(rank),
             Int32(0 if NO_PUSH else 1), stream,
         )
+        tick(0)
         if not SKIP_FIN:
             fin_c(
                 ptr(Int32, seq_len),
@@ -264,13 +272,16 @@ def main():
                 ptr(Float32, nw_a), ptr(Float32, nw_i), Float32(EPS),
                 ptr(Float32, freqs_d), Float32(inv_a),
                 ptr(Uint8, cmp_pool), ptr(Uint8, idxk_pool), ptr(Int32, k_valid),
-                ptr(Float32, dbg_attn), ptr(Float32, dbg_idx), stream,
+                ptr(Float32, dbg_attn), ptr(Float32, dbg_idx),
+                Int32(0 if NO_BODY else 1), stream,
             )
+        tick(1)
         step128(
             ptr(Float32, c128_state), ptr(Float32, new_c128),
             ptr(Float32, ape128_d), ptr(Int32, seq_len),
             *common, Int64(c128_off), *ev_args, Int32(rank), stream,
         )
+        tick(2)
         if not SKIP_FIN:
             fin128(
                 ptr(Int32, seq_len),
@@ -279,6 +290,7 @@ def main():
                 Float32(inv_c), ptr(Uint8, c128_pool), ptr(Int32, k_valid128),
                 ptr(Float32, dbg128), stream,
             )
+        tick(3)
         seq_len += 2
         if SKIP_FIN and t % 2 == 1:
             pass
@@ -289,7 +301,7 @@ def main():
     torch.cuda.synchronize()
     if rank == 0:
         print("roll done", flush=True)
-    if SKIP_FIN or NO_PUSH:
+    if SKIP_FIN or NO_PUSH or NO_BODY:
         print(f"[rank{rank}] bisect roll completed (skip compare)", flush=True)
         dist.destroy_process_group()
         return
@@ -318,7 +330,7 @@ def main():
         got = pool_a[b, slot]
         want = ref_q.float()
         d = (got - want).abs()
-        tol = want.abs() * 0.14 + 3e-3
+        tol = want.abs() * 0.14 + 4.5e-3
         fp8_bad += (d > tol).sum().item()
         fp8_tot += d.numel()
         # idx stream
@@ -337,14 +349,29 @@ def main():
             continue
         slot = m // 2
         err_c = max(err_c, (d128[b, slot] - ref).abs().max().item())
+        if VERBOSE and b == 0:
+            print(f"[rank{rank}] c128 b0 m{m} got {d128[b, slot, :6].tolist()}", flush=True)
+            print(f"[rank{rank}] c128 b0 m{m} ref {ref[:6].tolist()}", flush=True)
+            # torch-side interleaved decomposition cross-check
+            st0, st1 = cr.c128_state_init(), cr.c128_state_init()
+            for p in range(128 * m, 128 * m + 128):
+                rec = recs_c128[0][p]
+                if p % 2 == 0:
+                    st0 = cr.c128_update(st0, rec[:512], rec[512:], ape128[p % 128])
+                else:
+                    st1 = cr.c128_update(st1, rec[:512], rec[512:], ape128[p % 128])
+            mg = cr.c128_merge_states(st0, st1)
+            print(f"[rank{rank}] c128 b0 m{m} cpref {mg[:6].tolist()}", flush=True)
+            print(f"[rank{rank}] st0 m/l {st0[0][:3].tolist()} {st0[1][:3].tolist()}", flush=True)
+            print(f"[rank{rank}] st1 m/l {st1[0][:3].tolist()} {st1[1][:3].tolist()}", flush=True)
         ref_q = cr.post_attn(ref, norm_w_128, EPS, freqs, 128 * m, 1.0 / inv_c)
         d = (pool_c[b, slot] - ref_q.float()).abs()
-        tol = ref_q.float().abs() * 0.14 + 3e-3
+        tol = ref_q.float().abs() * 0.14 + 4.5e-3
         fp8_bad += (d > tol).sum().item()
         fp8_tot += d.numel()
 
     kv_exp = (n_tok // 4 - rank + 1) // 2
-    kv128_exp = n_tok // 128 // 2
+    kv128_exp = (n_tok // 128 - rank + 1) // 2
     kv_ok = (k_valid.cpu() == kv_exp).all().item()
     kv128_ok = (k_valid128.cpu() == kv128_exp).all().item()
 

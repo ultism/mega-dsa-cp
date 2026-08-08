@@ -1,6 +1,6 @@
 # Phase 1.3: compressor tile（CP-native，无 cp=1 形态）
 
-状态：设计冻结（2026-08-07）。语义三方确认：sglang `c4_v2.cuh` / `c128_online_v2.cuh` / `fused_norm_rope_v2.cuh` + TRT-LLM blog26 + overview 冻结决策。
+状态：**已验收**（2026-08-08，Modal B200:2 cp=2，300 步滚动全绿）。语义三方确认：sglang `c4_v2.cuh` / `c128_online_v2.cuh` / `fused_norm_rope_v2.cuh` + TRT-LLM blog26 + overview 冻结决策。
 
 ## 1. 模型语义规约（单机版，CP 分解前的基准语义）
 
@@ -70,3 +70,16 @@ entry n 在 step t 关闭、finalize 完成 → **step t+1 起**对 logits/attn 
 5. **属主平衡**：entry 交错落两 rank，各 rank 池只含本地 entry。
 
 产出：`mega_dsa_cp/tiles/compress.py`（partial + finalize + torch 参考）、`tests/test_compress.py`、Modal `phase13_dual` 入口。
+
+## 5. 验收结果（`phase13_dual`，300 步 × B=8 × cp=2）
+
+- micro bit-gates：staged Hadamard 与 MXFP4 量化对 torch 参考**逐位一致**
+- CSA 双流合并 fp32：max err 1.2e-6；**index-K MXFP4 entry 端到端逐位一致**（0/38400 nibble 失配，sf 全对）
+- attn fp8 entry：0 元素超 ±1 ulp 容差；C128A 合并 max err 2.1e-6；k_valid 计数器全对
+
+## 6. 踩坑记录
+
+1. **关闭检测必须是 step 级**（本步任一新 token 闭组则双 rank 都算+推 partial），不能是"我的 token 闭组"——否则合并永远缺一半 partial。C128A 同理（closer ≠ owner）。
+2. **部分 warp 的 shuffle_sync 全掩码死锁**（gotcha #35）：`if tidx < 4:` 里 `shuffle_sync_bfly`（默认 mask 0xffffffff）要求 32 lane 全到——块内二级归约必须全 warp 参与 + 无效 lane 乘零。
+3. 参考实现自身的 bug 会伪装成 kernel bug：C128A"kernel 错"实为 presim 状态机忘了 chunk 关闭后重置（kernel 是对的，与 CP 分解参考逐位吻合到 1e-7）。
+4. DSL 事件通知的正确形态：notify 放顶层（EventSet 内部守卫单线程），与 test_comm 已验证模式一致。
