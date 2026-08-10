@@ -67,7 +67,7 @@ def _run_case(name, B, q, L, maxK, top_k, mode, seed=0):
     torch.cuda.synchronize()
     rv, ri, rc = merge_topk_ref(v, i, c, top_k)
 
-    assert dbg.item() == 0, f"[{name}] emit-count mismatch dbg={dbg.item()}"
+    assert dbg[0].item() == 0, f"[{name}] emit-count mismatch dbg={dbg[0].item()}"
     assert torch.equal(out_c, rc), f"[{name}] counts differ"
     # ordered bitwise comparison (v via int32 view)
     kv, kr = out_v.view(torch.int32), rv.view(torch.int32)
