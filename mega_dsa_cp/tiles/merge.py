@@ -148,17 +148,15 @@ class MergeTopK:
         sState = smem.allocate_tensor(Int64, cute.make_layout((2,)), 16)
 
         # stage per-list counts + total
-        if tidx == 0:
-            sAux[2] = Int32(0)
+        sCntL[tidx] = Int32(0)
         cute.arch.barrier()
         if tidx < L:
             sCntL[tidx] = mCandC[(b, t, tidx)]
         cute.arch.barrier()
         if tidx == 0:
             tot = Int32(0)
-            for l in cutlass.range_constexpr(256):
-                if l < L:
-                    tot += sCntL[l]
+            for l in range(256):
+                tot += sCntL[l]
             sAux[0] = tot
         cute.arch.barrier()
         m_total = sAux[0]
