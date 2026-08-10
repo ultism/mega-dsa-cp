@@ -161,6 +161,12 @@ def phase14_debugtiny() -> None:
     _run(["python", "tests/debug_merge_tiny.py"], timeout=600)
 
 
+@app.function(gpu="B200", image=image, timeout=900, retries=0)
+def phase14_lse() -> None:
+    """Phase 1.4c single-GPU: LSE merge tile vs torch reference."""
+    _run(["python", "tests/test_lse_merge.py"], timeout=600)
+
+
 @app.function(gpu="B200", image=image, timeout=1200, retries=0)
 def phase14_merge() -> None:
     """Phase 1.4b single-GPU: merge tile vs torch reference."""
