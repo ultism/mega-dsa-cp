@@ -279,6 +279,13 @@ class MergeTopK:
             mOutC[(b, t)] = sAux[4]
             if sAux[4] != expect:
                 red_add_u32_gmem(dbg_ptr, Int32(1))
+            # debug taps: [4]=m_total [5]=emit_total [6]=tau_lo [7]=tau_hi
+            cute.arch.store(dbg_ptr + 4, sAux[0], sem="relaxed", scope="gpu")
+            cute.arch.store(dbg_ptr + 5, sAux[4], sem="relaxed", scope="gpu")
+            cute.arch.store(dbg_ptr + 6, Int32(tau & Int64(0xFFFFFFFF)),
+                            sem="relaxed", scope="gpu")
+            cute.arch.store(dbg_ptr + 7, Int32(tau >> 56),
+                            sem="relaxed", scope="gpu")
 
 
 
