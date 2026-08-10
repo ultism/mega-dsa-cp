@@ -58,7 +58,7 @@ def _run_case(name, B, q, L, maxK, top_k, mode, seed=0):
     out_v = torch.zeros(B, q, top_k, dtype=torch.float32, device=DEV)
     out_i = torch.zeros(B, q, top_k, dtype=torch.int32, device=DEV)
     out_c = torch.zeros(B, q, dtype=torch.int32, device=DEV)
-    dbg = torch.zeros(1, dtype=torch.int32, device=DEV)
+    dbg = torch.zeros(64, dtype=torch.int32, device=DEV)
     run_merge_topk(v, i, c, out_v, out_i, out_c, dbg, top_k=top_k)
     out_v2 = torch.zeros_like(out_v)
     out_i2 = torch.zeros_like(out_i)

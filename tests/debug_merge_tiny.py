@@ -22,7 +22,7 @@ def main():
     out_v = torch.zeros(B, q, K, device=DEV)
     out_i = torch.zeros(B, q, K, dtype=torch.int32, device=DEV)
     out_c = torch.zeros(B, q, dtype=torch.int32, device=DEV)
-    dbg = torch.zeros(16, dtype=torch.int32, device=DEV)
+    dbg = torch.zeros(64, dtype=torch.int32, device=DEV)
     run_merge_topk(v, i, c, out_v, out_i, out_c, dbg, top_k=K)
     torch.cuda.synchronize()
     rv, ri, rc = merge_topk_ref(v, i, c, K)

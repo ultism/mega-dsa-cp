@@ -223,7 +223,10 @@ class MergeTopK:
                         cum = Int32(0)
                         bnd = Int32(0)
                         c_gt = Int32(0)
-                        for bin_i in range(255, -1, -1):
+                        # signed-i64 descending: 127..0 then 255..128 (keys are
+                        # top-bit-flipped; unsigned 255..0 order would invert)
+                        for bin_i in list(range(127, -1, -1)) + list(
+                                range(255, 127, -1)):
                             cc = sHist[bin_i]
                             hit = (cum < remaining) & (cum + cc >= remaining)
                             bnd = sel_i32(hit, Int32(bin_i), bnd)
