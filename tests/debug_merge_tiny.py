@@ -26,14 +26,18 @@ def main():
     run_merge_topk(v, i, c, out_v, out_i, out_c, dbg, top_k=K)
     torch.cuda.synchronize()
     rv, ri, rc = merge_topk_ref(v, i, c, K)
-    print("dbg taps: m_total=%d emit=%d tau_lo=%08x tau_top=%08x" % (
+    print("dbg taps: m_total=%d emit=%d tau_b0=%02x tau_topbyte=%02x" % (
         dbg[4].item(), dbg[5].item(),
-        dbg[6].item() & 0xFFFFFFFF, dbg[7].item() & 0xFFFFFFFF))
+        dbg[6].item() & 0xFF, dbg[7].item() & 0xFF))
+    for p in range(8):
+        print("  pass %d: bnd=%02x c_gt=%d rem2=%d hist[bnd]=%d" % (
+            p, dbg[8 + p * 4].item() & 0xFF, dbg[8 + p * 4 + 1].item(),
+            dbg[8 + p * 4 + 2].item(), dbg[8 + p * 4 + 3].item()))
     print("ref count:", rc[0, 0].item(), "kernel count:", out_c[0, 0].item())
     print("ref  ids:", ri[0, 0].tolist())
     print("kern ids:", out_i[0, 0].tolist())
     # expected tau from torch: 8th largest key
-    s = v[0, 0].view(torch.int32)
+    s = v[0, 0].reshape(-1).view(torch.int32)
     u = s.to(torch.int64) & 0xFFFFFFFF
     srt = torch.where(u >= 0x80000000, u ^ 0xFFFFFFFF, u ^ 0x80000000)
     key = ((srt << 32) | ((i[0, 0].reshape(-1).to(torch.int64)) ^ 0xFFFFFFFF))

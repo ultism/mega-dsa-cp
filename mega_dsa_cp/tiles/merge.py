@@ -79,6 +79,28 @@ def make_key64(v: Float32, ix: Int32, *, loc=None, ip=None) -> Int64:
     )
 
 
+@dsl_user_op
+def i64_byte(x: Int64, shift: int, *, loc=None, ip=None) -> Int32:
+    """(x >> shift) & 0xFF as Int32 — avoids Int64->Int32 constructor narrowing
+    (unproven on this toolchain). shift is a trace-time python int."""
+    return Int32(
+        llvm.inline_asm(
+            Int32.mlir_type,
+            [Int64(x).ir_value(loc=loc, ip=ip)],
+            """{
+            .reg .b64 t;
+            shr.b64 t, $1, %d;
+            and.b64 t, t, 0xFF;
+            cvt.u32.u64 $0, t;
+            }""" % shift,
+            "=r,l",
+            has_side_effects=False,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
 class MergeTopK:
     """Exact top-K over L concatenated candidate lists, per (b,t)."""
 
@@ -192,9 +214,7 @@ class MergeTopK:
                                     ok = ((key - prefix)
                                           >> (64 - 8 * p)) == Int64(0)
                                 if ok:
-                                    bin_i = Int32(
-                                        ((key >> shift) & Int64(0xFF))
-                                    )
+                                    bin_i = i64_byte(key, shift)
                                     atom_add_u32(sHist.iterator + bin_i,
                                                  Int32(1))
                     cute.arch.barrier()
@@ -214,6 +234,14 @@ class MergeTopK:
                         sState[0] = new_prefix
                         rem2 = remaining - c_gt
                         sAux[1] = rem2
+                        cute.arch.store(dbg_ptr + 8 + p * 4, bnd,
+                                        sem="relaxed", scope="gpu")
+                        cute.arch.store(dbg_ptr + 8 + p * 4 + 1, c_gt,
+                                        sem="relaxed", scope="gpu")
+                        cute.arch.store(dbg_ptr + 8 + p * 4 + 2, rem2,
+                                        sem="relaxed", scope="gpu")
+                        cute.arch.store(dbg_ptr + 8 + p * 4 + 3, sHist[bnd],
+                                        sem="relaxed", scope="gpu")
                         if rem2 == sHist[bnd]:
                             # boundary bin exactly fills: tau is final
                             sState[1] = new_prefix
@@ -282,9 +310,9 @@ class MergeTopK:
             # debug taps: [4]=m_total [5]=emit_total [6]=tau_lo [7]=tau_hi
             cute.arch.store(dbg_ptr + 4, sAux[0], sem="relaxed", scope="gpu")
             cute.arch.store(dbg_ptr + 5, sAux[4], sem="relaxed", scope="gpu")
-            cute.arch.store(dbg_ptr + 6, Int32(tau & Int64(0xFFFFFFFF)),
+            cute.arch.store(dbg_ptr + 6, i64_byte(tau, 0),
                             sem="relaxed", scope="gpu")
-            cute.arch.store(dbg_ptr + 7, Int32(tau >> 56),
+            cute.arch.store(dbg_ptr + 7, i64_byte(tau, 56),
                             sem="relaxed", scope="gpu")
 
 
