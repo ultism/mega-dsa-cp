@@ -10,6 +10,11 @@ Gates (per docs/phase1.4-comm-tasks.md §7):
   - emit-count dbg counter stays 0
 """
 
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
 import torch
 
 from mega_dsa_cp.tiles.merge import run_merge_topk
