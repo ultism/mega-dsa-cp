@@ -35,16 +35,22 @@ def main():
             dbg[8 + p * 4 + 2].item(), dbg[8 + p * 4 + 3].item()))
     print("ref count:", rc[0, 0].item(), "kernel count:", out_c[0, 0].item())
     print("ref  ids:", ri[0, 0].tolist())
-    print("kern ids:", out_i[0, 0].tolist())
-    # expected tau from torch: 8th largest key
-    s = v[0, 0].reshape(-1).view(torch.int32)
-    u = s.to(torch.int64) & 0xFFFFFFFF
-    srt = torch.where(u >= 0x80000000, u ^ 0xFFFFFFFF, u ^ 0x80000000)
-    key = ((srt << 32) | ((i[0, 0].reshape(-1).to(torch.int64)) ^ 0xFFFFFFFF))
-    key = key ^ (1 << 63)
-    key_s = torch.where(key >= (1 << 63), key - (1 << 64), key)
-    tau_exp = torch.sort(key_s, descending=True).values[K - 1]
-    print("expected tau: %016x" % (tau_exp.item() & 0xFFFFFFFFFFFFFFFF))
+    print("kern ids:", out_i[0, 0, : max(out_c[0, 0].item(), 1)].tolist())
+    # torch-side key table (descending) with tau line
+    s2 = v[0, 0].reshape(-1).view(torch.int32)
+    u2 = s2.to(torch.int64) & 0xFFFFFFFF
+    srt2 = torch.where(u2 >= 0x80000000, u2 ^ 0xFFFFFFFF, u2 ^ 0x80000000)
+    lo = (i[0, 0].reshape(-1).to(torch.int64)) ^ 0xFFFFFFFF
+    key_u = (srt2 << 32) | lo
+    order = torch.argsort(key_u, descending=True)
+    for r, idx in enumerate(order.tolist()):
+        ku = key_u[idx].item()
+        flipped = (ku ^ (1 << 63)) & 0xFFFFFFFFFFFFFFFF
+        mark = " <-- tau(top byte 3e)" if r == 7 else ""
+        mark += " KERNEL-ONLY" if idx in (4,) else ""
+        print(f"  rank{r:2d} id={idx:2d} v={v[0,0].reshape(-1)[idx].item():+.4f} "
+              f"key_flipped={flipped:016x}{mark}")
+
 
 
 if __name__ == "__main__":
