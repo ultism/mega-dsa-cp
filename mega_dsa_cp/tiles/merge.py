@@ -37,9 +37,9 @@ N_THREADS = 256
 
 @cute.jit
 def red_add_u32_gmem(ptr: cute.Pointer, val: Int32) -> None:
-    """Device-scope posted red for the dbg counter (cute.arch.red shape, cf.
+    """GPU-scope posted red for the dbg counter (cute.arch.red shape, cf.
     events/ptx.py — raw inline-asm red fails NVVM on this toolchain)."""
-    cute.arch.red(ptr, val, op="add", dtype="u32", sem="relaxed", scope="device")
+    cute.arch.red(ptr, val, op="add", dtype="u32", sem="relaxed", scope="gpu")
 
 
 @dsl_user_op
