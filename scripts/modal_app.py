@@ -143,6 +143,13 @@ def phase13_probe() -> None:
     _run(["python", "tests/probe_compress_compile.py"], timeout=600)
 
 
+@app.function(gpu="B200", image=image, timeout=1200, retries=0)
+def phase14_merge() -> None:
+    """Phase 1.4b single-GPU: merge tile vs torch reference."""
+    _run(["nvidia-smi"])
+    _run(["python", "tests/test_merge.py"], timeout=900)
+
+
 @app.function(gpu="B200:2", image=image, timeout=900, retries=0)
 def phase13_debug_nobody() -> None:
     """Phase 1.3 short roll, finalize wait-only (bisect)."""
