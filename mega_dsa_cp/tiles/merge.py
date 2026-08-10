@@ -116,12 +116,13 @@ class MergeTopK:
         layout_o = cute.make_ordered_layout(
             (B, self.q_len, self.top_k), order=(2, 1, 0)
         )
+        layout_oc = cute.make_ordered_layout((B, self.q_len), order=(1, 0))
         mCandV = cute.make_tensor(cand_v_ptr, layout_v)
         mCandI = cute.make_tensor(cand_i_ptr, layout_v)
         mCandC = cute.make_tensor(cand_c_ptr, layout_c)
         mOutV = cute.make_tensor(out_v_ptr, layout_o)
         mOutI = cute.make_tensor(out_i_ptr, layout_o)
-        mOutC = cute.make_tensor(out_c_ptr, layout_c)
+        mOutC = cute.make_tensor(out_c_ptr, layout_oc)
         self.kernel(
             mCandV, mCandI, mCandC, mOutV, mOutI, mOutC, L, maxK, dbg_ptr
         ).launch(
