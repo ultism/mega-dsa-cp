@@ -35,20 +35,11 @@ from mega_dsa_cp.tiles.logits import atom_add_u32, sel_i32
 N_THREADS = 256
 
 
-@dsl_user_op
-def red_add_u32_gmem(ptr: cute.Pointer, val: Int32, *, loc=None, ip=None) -> None:
-    llvm.inline_asm(
-        None,
-        [
-            ptr.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip),
-            Int32(val).ir_value(loc=loc, ip=ip),
-        ],
-        "red.relaxed.device.global.add.u32 [$0], $1;",
-        "l,r",
-        has_side_effects=True,
-        loc=loc,
-        ip=ip,
-    )
+@cute.jit
+def red_add_u32_gmem(ptr: cute.Pointer, val: Int32) -> None:
+    """Device-scope posted red for the dbg counter (cute.arch.red shape, cf.
+    events/ptx.py — raw inline-asm red fails NVVM on this toolchain)."""
+    cute.arch.red(ptr, val, op="add", dtype="u32", sem="relaxed", scope="device")
 
 
 @dsl_user_op
