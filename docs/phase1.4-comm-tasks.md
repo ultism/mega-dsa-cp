@@ -121,6 +121,17 @@ chunk 级候选（logits 输出，(B,q,C,K)）与 L2 输出 `sel`（(B,q,K) entr
 - **1.4b**：merge tile 单卡验收 —— L1/L2 同 kernel 两配置，vs torch.topk
   参考：集合重合 1.0000；确定性（同输入两跑逐位同）；变长 count（θ 过滤后
   <K）；K∈{512,1024}；M 覆盖 C×K 全范围（C=1..S_bucket 上限）。
+- **1.4b 已验收（2026-08-08，Modal B200）**：`tiles/merge.py` 单 kernel 双配置
+  （L1/L2 同构），256 线程/CTA（统一了设计表的 256/128 估计行）。实现事实：
+  64-bit key = (sortable(logit)<<32)|~entry_id，顶位翻转进 signed 域；
+  **boundary scan 顺序按 pass 区分**——pass 0 顶字节 signed 降序（127..0 接
+  255..128），pass 1-7 普通 unsigned 降序（255..0），翻转只影响顶字节；
+  early exit（boundary bin 恰好填满即停，实测 1-2 pass 收敛）；确定性
+  two-pass strip emit（输入序输出，禁 atomic 乱序）。验收 10 例全 PASS：
+  K∈{512,1024}、L∈{1,2,4,8,256}（L=256 即 S=1M/cp=2 的 chunk 数）、
+  full/变长/tiny(M<K)/密集 tie/全等/-inf 混合，**有序逐位一致**（同集合同
+  顺序）+ 双跑确定性。踩坑：m_total 归约曾踩 #32 变体（constexpr 循环内动态
+  if 改循环携带变量）；扫描顺序 bug 见上。
 - **1.4c**：LSE merge 单卡 —— vs torch 参考（同公式），fp32 容差 1e-6，
   含 cp=2/4 份数、LSE 含 -inf 边界。
 - **1.4d**：骨架逐链接线 cp=2（沿用 Phase 0.4 harness + `codegen_schedule`
