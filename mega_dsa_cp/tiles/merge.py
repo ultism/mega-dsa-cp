@@ -223,10 +223,14 @@ class MergeTopK:
                         cum = Int32(0)
                         bnd = Int32(0)
                         c_gt = Int32(0)
-                        # signed-i64 descending: 127..0 then 255..128 (keys are
-                        # top-bit-flipped; unsigned 255..0 order would invert)
-                        for bin_i in list(range(127, -1, -1)) + list(
-                                range(255, 127, -1)):
+                        # signed-i64 descending: pass 0 scans the sign-flipped
+                        # top byte (127..0 then 255..128); later bytes are plain
+                        # unsigned-ordered (255..0) — the flip touches only the
+                        # top byte.
+                        scan = (list(range(127, -1, -1))
+                                + list(range(255, 127, -1))) if p == 0 else \
+                            list(range(255, -1, -1))
+                        for bin_i in scan:
                             cc = sHist[bin_i]
                             hit = (cum < remaining) & (cum + cc >= remaining)
                             bnd = sel_i32(hit, Int32(bin_i), bnd)
