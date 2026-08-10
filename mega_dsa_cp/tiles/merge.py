@@ -225,29 +225,29 @@ class MergeTopK:
 
         tau = sState[1]
 
-        # ---- deterministic emit: two-pass strip partition over padded space
+        # ---- deterministic emit: two-pass strip partition over padded space.
+        # gotcha-32 discipline: no local-var assignment inside dynamic `if`
+        # that crosses the region boundary — all predication via sel_*.
         m_pad = L * maxK
         strip = (m_pad + N_THREADS - 1) // N_THREADS
         start = cutlass.min(tidx * strip, m_pad)
         end = cutlass.min(start + strip, m_pad)
-        cnt = Int32(0)
         n_walk = end - start
         l0 = start // maxK
         j0 = start % maxK
-        for _ in cutlass.range(n_walk, unroll=1):
-            v = Float32(0.0)
-            ix = Int32(0)
-            hit = cutlass.Boolean(False)
-            if j0 < sCntL[l0]:
-                v = mCandV[(b, t, l0, j0)]
-                ix = mCandI[(b, t, l0, j0)]
-                hit = make_key64(v, ix) >= tau
-            if hit:
-                cnt += Int32(1)
-            j0 += Int32(1)
-            if j0 == maxK:
-                j0 = Int32(0)
-                l0 += Int32(1)
+        cnt = Int32(0)
+        for _u in cutlass.range(strip, unroll=1):
+            live = _u < n_walk
+            l0s = cutlass.min(l0, L - 1)          # dead-walk clamp
+            in_range = live & (j0 < sCntL[l0s])
+            v = mCandV[(b, t, l0s, j0)]            # padded space: always in-bounds
+            ix = mCandI[(b, t, l0s, j0)]
+            hit = in_range & (make_key64(v, ix) >= tau)
+            cnt += sel_i32(hit, Int32(1), Int32(0))
+            j0n = j0 + Int32(1)
+            wrap = j0n == maxK
+            l0 = sel_i32(wrap, l0 + Int32(1), l0)
+            j0 = sel_i32(wrap, Int32(0), j0n)
         sOff[tidx] = cnt
         cute.arch.barrier()
         if tidx == 0:
@@ -261,22 +261,21 @@ class MergeTopK:
         w = sOff[tidx]
         l0 = start // maxK
         j0 = start % maxK
-        for _ in cutlass.range(n_walk, unroll=1):
-            v = Float32(0.0)
-            ix = Int32(0)
-            hit = cutlass.Boolean(False)
-            if j0 < sCntL[l0]:
-                v = mCandV[(b, t, l0, j0)]
-                ix = mCandI[(b, t, l0, j0)]
-                hit = make_key64(v, ix) >= tau
+        for _u in cutlass.range(strip, unroll=1):
+            live = _u < n_walk
+            l0s = cutlass.min(l0, L - 1)
+            in_range = live & (j0 < sCntL[l0s])
+            v = mCandV[(b, t, l0s, j0)]
+            ix = mCandI[(b, t, l0s, j0)]
+            hit = in_range & (make_key64(v, ix) >= tau)
             if hit:
                 mOutV[(b, t, w)] = v
                 mOutI[(b, t, w)] = ix
-                w += Int32(1)
-            j0 += Int32(1)
-            if j0 == maxK:
-                j0 = Int32(0)
-                l0 += Int32(1)
+            w = sel_i32(hit, w + Int32(1), w)
+            j0n = j0 + Int32(1)
+            wrap = j0n == maxK
+            l0 = sel_i32(wrap, l0 + Int32(1), l0)
+            j0 = sel_i32(wrap, Int32(0), j0n)
         if tidx == 0:
             expect = cutlass.min(m_total, Int32(self.top_k))
             mOutC[(b, t)] = sAux[4]
