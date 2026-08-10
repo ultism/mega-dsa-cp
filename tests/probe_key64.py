@@ -29,6 +29,13 @@ class ProbeKeyNum:
         mi = cute.make_tensor(i, cute.make_layout((32,)))
         mo = cute.make_tensor(o, cute.make_layout((32,)))
         mo[tidx] = make_key64(mv[tidx], mi[tidx])
+        # signed-compare probe: slot 8..15 hold key >= key(v=1.0,i=0)
+        if tidx >= 8:
+            mo[tidx] = Int64(0)
+        if tidx < 8:
+            k = make_key64(mv[tidx], mi[tidx])
+            kth = make_key64(mv[0], mi[0])
+            mo[tidx + 8] = Int64(1) if k >= kth else Int64(0)
 
 
 def py_key(v: float, i: int) -> int:
@@ -62,6 +69,14 @@ def main():
        stream)
     torch.cuda.synchronize()
     ok = True
+    ref_th = py_key(vals[0], ids[0])
+    for j in range(n):
+        ge = o[j + 8].item()
+        exp_ge = 1 if py_key(vals[j], ids[j]) >= ref_th else 0
+        st = "OK " if ge == exp_ge else "CMP-MISMATCH"
+        if ge != exp_ge:
+            ok = False
+        print(f"{st} cmp v={vals[j]:>8} key>=key(1.0,0): got={ge} exp={exp_ge}")
     for j in range(n):
         exp = py_key(vals[j], ids[j])
         got = o[j].item()
